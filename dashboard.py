@@ -19,7 +19,9 @@ def load_and_clean_data(file):
     elif file.type == "text/csv":
         # Handle CSV files
         sheets = [None] # CSVs don't have sheets, so we can iterate once
-        parser_func = lambda sheet_name, header_val: pd.read_csv(file, header=header_val)
+        # Ensure the file pointer is reset for each read attempt in the loop
+        file.seek(0) # Reset once before the loop
+        parser_func = lambda sheet_name, header_val: (file.seek(0), pd.read_csv(file, header=header_val))[1]
     else:
         raise ValueError("Unsupported file type. Please upload an Excel (.xlsx) or CSV (.csv) file.")
 
@@ -91,7 +93,7 @@ def al_to_numeric(al):
     if al in ['A', 'Distinction']: return 1
     elif al in ['B', 'Merit']: return 2
     elif al in ['C', 'Pass']: return 3
-    elif al in ['Ungraded']: return 4 # Ungraded is typically worse than a pass, but numerically better than AL8
+    elif al in ['Ungraded']: return 4 # Ungraded is typically worse than a pass, but numerically "better" (lower) than AL8 score
 
     try:
         # For AL1 to AL8, extract the number
@@ -102,8 +104,6 @@ def al_to_numeric(al):
 def map_to_al_for_agg(subject, mark):
     """
     Converts a subject mark to a numeric AL score for aggregate calculation.
-    This uses a simplified mapping where higher AL values (e.g., A=1, B=2, C=3)
-    are treated as higher scores for aggregation (e.g., A=1, B=2, C=3).
     Foundation subjects are mapped to equivalent AL scores for standard subjects.
     Higher Mother Tongue is excluded for aggregate AL calculation.
     """
@@ -129,6 +129,74 @@ def map_to_al_for_agg(subject, mark):
         elif mark >= 20: return 7
         else: return 8 # AL8 or worse
 
+def count_student_weak_subjects(row, all_subject_cols_original, al_converter_func):
+    """
+    Calculates the *count* of 'weak' subjects for a student for the data column.
+    A subject is considered weak if its AL score is 2 or more points worse
+    (higher numeric AL value) than the student's average AL score across all their subjects.
+    """
+    student_all_als_numeric = []
+    for s_orig in all_subject_cols_original:
+        al_col_name_orig = f"{s_orig}_AL"
+        if al_col_name_orig in row.index: # Check if the AL column exists in the student's data row
+            al_val_str = row.get(al_col_name_orig)
+            al_val_num = al_converter_func(al_val_str)
+            if al_val_num is not None:
+                student_all_als_numeric.append(al_val_num)
+
+    if not student_all_als_numeric: # No numeric AL scores found for the student
+        return 0
+
+    avg_al = np.mean(student_all_als_numeric)
+    if pd.isna(avg_al): # Handle case where avg_al might be NaN
+        return 0
+
+    weak_subject_count = 0
+    for s_orig in all_subject_cols_original:
+        al_col_name_orig = f"{s_orig}_AL"
+        if al_col_name_orig in row.index:
+            al_val_str = row.get(al_col_name_orig)
+            numeric_subject_al = al_converter_func(al_val_str)
+            if numeric_subject_al is not None:
+                if (numeric_subject_al - avg_al) >= 2:
+                    weak_subject_count += 1
+    return weak_subject_count
+
+def get_weak_subject_styles(row, all_subject_cols_original, al_converter_func):
+    """
+    Generates CSS styles to highlight 'weak' subject AL cells for DataFrame.style.apply.
+    A subject is considered weak if its AL score is 2 or more points worse
+    (higher numeric AL value) than the student's average AL score across all their subjects.
+    """
+    styles_for_row = [''] * len(row.index)
+
+    student_all_als_numeric = []
+    for s_orig in all_subject_cols_original:
+        al_col_name_orig = f"{s_orig}_AL"
+        if al_col_name_orig in row.index:
+            al_val_str = row.get(al_col_name_orig)
+            al_val_num = al_converter_func(al_val_str)
+            if al_val_num is not None:
+                student_all_als_numeric.append(al_val_num)
+
+    if not student_all_als_numeric:
+        return styles_for_row
+
+    avg_al = np.mean(student_all_als_numeric)
+    if pd.isna(avg_al):
+        return styles_for_row
+
+    for i, col_name_in_display in enumerate(row.index):
+        if col_name_in_display.endswith('_AL'):
+            original_subject_name_for_display_col = col_name_in_display.replace('_AL', '')
+            if original_subject_name_for_display_col in all_subject_cols_original:
+                subject_al_val_str = row.get(col_name_in_display)
+                numeric_subject_al = al_converter_func(subject_al_val_str)
+                if numeric_subject_al is not None:
+                    if (numeric_subject_al - avg_al) >= 2:
+                        styles_for_row[i] = 'background-color: #ffcccc' # Light red for weak subjects
+    return styles_for_row
+
 # --- App Setup ---
 st.set_page_config(page_title="Student Dashboard", layout="wide")
 st.title("🎓 Student Performance Dashboard")
@@ -140,57 +208,54 @@ if uploaded_file:
     try:
         with st.spinner("Loading and processing data... This may take a moment."):
             df, sheet_used, header_row = load_and_clean_data(uploaded_file)
-        st.success(f"✅ Successfully loaded data from {'sheet' if sheet_used != 'N/A' else 'file'} '{uploaded_file.name}' using header row {header_row + 1}.")
+        st.success(f"✅ Successfully loaded data from {'sheet' if sheet_used != 'N/A' else 'file'} '{uploaded_file.name}' (header found at row {header_row + 1}).")
 
         # --- Data Preprocessing after successful upload ---
-        # Automatically detect subject columns based on numeric content
         subject_columns = []
-        # Filter out "Unnamed: X" columns immediately from the potential columns
         cleaned_df_columns = [col for col in df.columns if not str(col).strip().lower().startswith('unnamed:')]
         
-        for col in cleaned_df_columns: # Iterate over the cleaned list of columns
-            col_lower = str(col).lower().strip()
-            # Exclude known non-subject columns
-            if col_lower in ['name', 'class', 'total marks', 'aggregate al', 'weak subjects']:
+        # Define a more comprehensive list of known non-subject column names
+        known_non_subject_names = [
+            'name', 'class', 'total marks', 'aggregate al', 'weak subjects', 'weak subjects (count)',
+            'age', 'reg#', 'reg no', 'registration number', 'student id', 'index no', 'level', 'gender',
+            'grade summary', 'summary', 'remarks', 'conduct', 'attendance', 'overall', 'rank', 'position'
+            # Add more known non-subject column names from your specific files if needed
+        ]
+
+        for col in cleaned_df_columns:
+            col_original_case = str(col).strip() # Keep original case for subject_columns list
+            col_lower = col_original_case.lower()
+            
+            if col_lower in known_non_subject_names:
                 continue
 
-            # Check if the column is primarily numeric (marks)
-            temp_series = pd.to_numeric(df[col], errors='coerce')
-            
-            # A column is considered a potential subject column if:
-            # 1. It's not a boolean column.
-            # 2. It contains numeric data (after coercing errors to NaN).
-            # 3. More than 50% of its values are non-NaN numeric. This helps distinguish mark columns from IDs or other mixed data.
-            # 4. It's not entirely empty after numeric conversion.
+            temp_series = pd.to_numeric(df[col_original_case], errors='coerce')
             numeric_ratio = temp_series.count() / len(df) if len(df) > 0 else 0
             
-            if pd.api.types.is_numeric_dtype(temp_series) and numeric_ratio > 0.5 and not pd.api.types.is_bool_dtype(df[col]):
-                subject_columns.append(col)
+            if pd.api.types.is_numeric_dtype(temp_series) and numeric_ratio > 0.5 and not pd.api.types.is_bool_dtype(df[col_original_case]):
+                subject_columns.append(col_original_case) # Use original column name
 
-        # Final filter: Remove "Total Marks" if it was somehow included by numeric detection
-        subject_columns = [col for col in subject_columns if 'total marks' not in col.lower()]
+        subject_columns = [col for col in subject_columns if 'total marks' not in str(col).lower()] # Final filter
 
         if not subject_columns:
-            st.warning("No subject mark columns detected automatically. Please ensure your subject columns contain numeric values. If not, the current automatic detection may not work.")
+            st.warning("⚠️ No subject mark columns detected automatically. Please ensure your subject columns contain numeric values and are not in the exclusion list. You might need to adjust the `known_non_subject_names` list in the script if valid subjects are being excluded.")
             st.stop()
+        else:
+            st.info(f"Detected subject columns: {', '.join(subject_columns)}")
 
-        # Explicitly convert subject columns to numeric to handle mixed types
+
         for sub_col in subject_columns:
             if sub_col in df.columns:
                 df[sub_col] = pd.to_numeric(df[sub_col], errors='coerce')
             else:
                 st.warning(f"Subject column '{sub_col}' was detected but not found in the DataFrame for numeric conversion. Skipping.")
 
-
-        # Apply mark_to_al for each detected subject
         for sub in subject_columns:
-            if sub in df.columns: # Ensure the column exists before attempting to apply
+            if sub in df.columns:
                 df[f"{sub}_AL"] = df.apply(lambda row: mark_to_al(sub, row[sub]), axis=1)
             else:
-                st.warning(f"Automatically detected subject column '{sub}' not found in the loaded data. It will be skipped.")
+                st.warning(f"Automatically detected subject column '{sub}' not found in the loaded data for AL conversion. It will be skipped.")
 
-
-        # Calculate Total Marks (sum of all subject marks that were actually processed)
         mark_columns_for_total = [col for col in subject_columns if col in df.columns]
         if mark_columns_for_total:
             df['Total Marks'] = df[mark_columns_for_total].sum(axis=1, skipna=True)
@@ -198,332 +263,8 @@ if uploaded_file:
             df['Total Marks'] = np.nan
             st.warning("No valid subject mark columns were processed to calculate 'Total Marks'.")
 
-
-        # Calculate Aggregate AL (sum of best 4 standard + foundation ALs, excluding HMT)
-        def calculate_aggregate_al(row):
+        def calculate_aggregate_al_for_row(row):
             als_for_agg = []
             for sub in subject_columns:
-                al_val = map_to_al_for_agg(sub, row.get(sub)) # Use .get to safely access column
-                if al_val is not None:
-                    als_for_agg.append(al_val)
-
-            if not als_for_agg:
-                return None
-
-            # Sort and take the best 4 (lowest AL scores)
-            als_for_agg.sort()
-            best_4_als = als_for_agg[:4] # Take only the best 4 (lowest AL scores)
-
-            return sum(best_4_als)
-
-        df['Aggregate AL'] = df.apply(calculate_aggregate_al, axis=1)
-
-        # Ensure 'Class' column is of string type for consistent filtering
-        if 'Class' in df.columns:
-            df['Class'] = df['Class'].astype(str)
-        else:
-            st.error("The 'Class' column is missing from your data. Please ensure your file has a column named 'Class'.")
-            st.stop()
-
-
-    except ValueError as e:
-        st.error(f"❌ Error loading file: {e}")
-        st.stop()
-    except Exception as e:
-        st.error(f"An unexpected error occurred: {e}")
-        st.stop()
-else:
-    st.info("Please upload an Excel or CSV file to begin.")
-    st.stop()
-
-# Ensure df is not empty before proceeding with filters and charts
-if df.empty:
-    st.warning("No data to process. Please upload a valid Excel or CSV file.")
-    st.stop()
-
-# --- Sidebar Filters ---
-st.sidebar.header("Filter Data")
-
-all_classes = ['All Classes'] + sorted(df['Class'].unique().tolist())
-selected_class = st.sidebar.multiselect("Select Class(es)", options=all_classes, default=['All Classes'])
-
-if 'All Classes' in selected_class:
-    filtered_df = df.copy()
-else:
-    filtered_df = df[df['Class'].isin(selected_class)]
-
-# Check if subject_columns is available from the upload process
-if 'subject_columns' not in locals() or not subject_columns:
-    st.error("No subject columns were automatically detected. Please ensure your data contains numeric subject columns.")
-    st.stop()
-
-all_subjects = sorted(subject_columns)
-selected_subject = st.sidebar.selectbox("Select Subject for Analysis", options=all_subjects)
-
-if filtered_df.empty:
-    st.warning("No data to display after applying class filters.")
-    st.stop()
-
-# --- Define Sort Order by Subject Type for charts ---
-# This sort order is for AL categories (AL1, AL2, A, B, etc.)
-sort_order = []
-if selected_subject.startswith("Fn "):
-    sort_order = ['A', 'B', 'C']
-elif selected_subject in ['HCL', 'HML', 'HTL']:
-    sort_order = ['Distinction', 'Merit', 'Pass', 'Ungraded']
-else: # Standard Subjects
-    sort_order = ['AL1', 'AL2', 'AL3', 'AL4', 'AL5', 'AL6', 'AL7', 'AL8']
-
-# --- Summary Insights ---
-st.subheader("📊 Performance Summary")
-total_students = len(filtered_df)
-
-# Placeholder for Quantity and Quality Passes - Define your own criteria
-# Example: Quantity Pass = AL6 or better for standard, B or better for foundation, Pass or better for HMT
-# Quality Pass = AL3 or better for standard, A for foundation, Distinction for HMT
-quantity_passes = 0
-quality_passes = 0
-
-# Check if the selected subject's AL column exists in the filtered_df
-selected_subject_al_col = f"{selected_subject}_AL"
-if selected_subject_al_col in filtered_df.columns:
-    subject_al_data = filtered_df[selected_subject_al_col].dropna()
-    for al_score in subject_al_data:
-        if selected_subject.startswith("Fn "):
-            if al_score in ['A', 'B']: quantity_passes += 1
-            if al_score == 'A': quality_passes += 1
-        elif selected_subject in ['HCL', 'HML', 'HTL']:
-            if al_score in ['Distinction', 'Merit', 'Pass']: quantity_passes += 1
-            if al_score == 'Distinction': quality_passes += 1
-        else: # Standard Subjects
-            # Ensure al_score can be converted to numeric before comparison
-            numeric_al = al_to_numeric(al_score)
-            if numeric_al is not None:
-                if numeric_al <= 6: quantity_passes += 1
-                if numeric_al <= 3: quality_passes += 1
-
-col1, col2, col3 = st.columns(3)
-
-if total_students > 0:
-    with col1:
-        st.metric("Total Students", total_students)
-    with col2:
-        qty_pct = (quantity_passes / total_students) * 100
-        st.metric(f"Quantity Passes ({selected_subject})", f"{quantity_passes} ({qty_pct:.1f}%)")
-    with col3:
-        qlt_pct = (quality_passes / total_students) * 100
-        st.metric(f"Quality Passes ({selected_subject})", f"{qlt_pct:.1f}%)")
-else:
-    st.info("No students found matching the selected filters for summary insights.")
-
-st.markdown("---")
-
-# --- Class Summary Table ---
-st.subheader(f"📋 Class Summary for {selected_subject}")
-
-# Create a DataFrame for the class summary
-# Group by 'Class' and count occurrences of each AL category for the selected subject
-if selected_subject_al_col in filtered_df.columns:
-    grouped_data = filtered_df.groupby('Class')[selected_subject_al_col].value_counts().unstack(fill_value=0)
-
-    # Reindex to ensure all sort_order categories are present, even if empty
-    grouped = grouped_data.reindex(columns=sort_order, fill_value=0)
-
-    # Calculate totals and percentages
-    grouped['Total'] = grouped.sum(axis=1)
-    for cat in sort_order:
-        # Ensure no division by zero if Total is 0
-        grouped[f"{cat} (%)"] = (grouped[cat] / grouped['Total'] * 100).replace([np.inf, -np.inf], 0).round(1)
-
-    # Display the summary table
-    st.dataframe(grouped)
-else:
-    st.info(f"No AL data available for '{selected_subject}' to create class summary.")
-
-st.markdown("---")
-
-# --- Distribution Charts ---
-st.subheader(f"📈 {selected_subject} Performance Distribution")
-
-col_chart1, col_chart2 = st.columns(2)
-
-# Prepare data for charts
-# For Stacked Bar Chart (by Class)
-if selected_subject_al_col in filtered_df.columns:
-    chart_data = filtered_df.groupby(['Class', selected_subject_al_col]).size().reset_index(name='Count')
-    chart_data.columns = ['Class', 'Category', 'Count'] # Rename for Altair
-else:
-    chart_data = pd.DataFrame() # Empty DataFrame if no data
-
-with col_chart1:
-    st.write("### Distribution by Class")
-    if not chart_data.empty:
-        x_axis = alt.X('Category:N', sort=sort_order, title="Category")
-        y_axis = alt.Y('Count:Q', title="No. of Students")
-        color = alt.Color('Class:N', title='Class')
-
-        chart = alt.Chart(chart_data).mark_bar().encode(
-            x=x_axis,
-            y=y_axis,
-            color=color,
-            tooltip=['Class', 'Category', 'Count']
-        ).properties(
-            height=400,
-            title=f"{selected_subject} Performance Distribution by Class"
-        ).interactive() # Make chart interactive for zooming/panning
-        st.altair_chart(chart, use_container_width=True)
-    else:
-        st.info("No data for distribution by class for the selected subject.")
-
-# For Pie Chart (Overall Breakdown)
-if selected_subject_al_col in filtered_df.columns:
-    pie_data = filtered_df[selected_subject_al_col].value_counts().reset_index()
-    pie_data.columns = ['Category', 'Count'] # Rename for Plotly
-
-    # Ensure sort_order for pie chart categories and colors
-    pie_data['Category'] = pd.Categorical(pie_data['Category'], categories=sort_order, ordered=True)
-    pie_data = pie_data.sort_values('Category').dropna() # Drop NaN categories if any
-else:
-    pie_data = pd.DataFrame() # Empty DataFrame if no data
-
-if not pie_data.empty:
-    with col_chart2:
-        st.write("### Overall Breakdown")
-        # Define a color palette based on sort_order and number of categories
-        # You can customize these colors further
-        # Use a consistent map of AL categories to colors
-        category_colors = {
-            'AL1': '#003f5c', 'AL2': '#2f4b7c', 'AL3': '#416c99', 'AL4': '#5b8bb4',
-            'AL5': '#77a7cf', 'AL6': '#a0c4e4', 'AL7': '#c8e0f9', 'AL8': '#eff6ff',
-            'A': '#2ca02c', 'B': '#98df8a', 'C': '#ff7f0e', # Green for A/B, Orange for C
-            'Distinction': '#1f77b4', 'Merit': '#aec7e8', 'Pass': '#ffbb78', 'Ungraded': '#d62728' # Blue for HMT Dist/Merit, Orange for Pass, Red for Ungraded
-        }
-        # Filter colors to only those present in the current pie_data
-        colors_for_pie = [category_colors.get(cat, '#cccccc') for cat in pie_data['Category']]
-
-        fig = px.pie(
-            pie_data,
-            names='Category',
-            values='Count',
-            title=f"{selected_subject} Breakdown",
-            color_discrete_sequence=colors_for_pie # Use the defined color sequence
-        )
-        fig.update_traces(marker=dict(colors=colors_for_pie), sort=False) # Ensure sorting is by defined order
-        fig.update_layout(title_x=0.5) # Center the title
-        st.plotly_chart(fig, use_container_width=True)
-else:
-    with col_chart2:
-        st.info("No data for overall breakdown for the selected subject.")
-
-st.markdown("---")
-
-# --- Individual Student Table ---
-st.subheader("👤 Individual Student Performance")
-
-# Compute Weak Subjects count
-def calculate_weak_subjects(row, all_subject_cols_original, al_converter_func):
-    """
-    Calculates the number of 'weak' subjects for a student.
-    A subject is considered weak if its AL score is 2 or more points worse
-    (higher numeric AL value) than the student's average AL score across all subjects.
-    This function will be called by pandas styler.apply(axis=1), so 'row' will contain
-    the data for the current row across all displayed columns.
-    """
-    # Initialize styles list for all columns in the current row
-    styles_for_row = [''] * len(row.index)
-
-    # Get all valid AL scores for the student from *all* original subject columns
-    # This ensures avg_al is calculated across all subjects a student has taken,
-    # not just the subset of AL columns that might be displayed or highlighted.
-    als_numeric = []
-    for s in all_subject_cols_original:
-        al_col_name = f"{s}_AL"
-        # Check if the AL column for this subject exists in the current row's data
-        # (i.e., if it's one of the columns in sorted_df_display)
-        if al_col_name in row.index:
-            al_val = al_converter_func(row.get(al_col_name))
-            if al_val is not None:
-                als_numeric.append(al_val)
-
-    avg_al = np.mean(als_numeric) if als_numeric else None
-
-    # Now, iterate through each column in the `row` (which represents `sorted_df_display`'s columns)
-    # and apply styles only to the relevant AL columns.
-    for i, col_name in enumerate(row.index):
-        if col_name.endswith('_AL'):
-            original_subject_name = col_name.replace('_AL', '')
-            
-            # Ensure this is one of the originally selected subject columns
-            if original_subject_name in all_subject_cols_original:
-                subject_al_val = row.get(col_name) # Get the AL string value from the row
-                numeric_subject_al = al_converter_func(subject_al_val) # Convert to numeric for comparison
-
-                if numeric_subject_al is not None and avg_al is not None:
-                    # Check for "weak" condition
-                    if (numeric_subject_al - avg_al) >= 2:
-                        styles_for_row[i] = 'background-color: #ffcccc' # Light red for weak subjects
-        # All other columns (non-AL, or AL columns not matching original subjects) will remain with default '' style
-    return styles_for_row
-
-
-# Apply the weak subjects calculation
-# Ensure 'subject_columns' is defined before applying
-if 'subject_columns' in locals() and subject_columns:
-    filtered_df['Weak Subjects'] = filtered_df.apply(
-        lambda row: calculate_weak_subjects(
-            row,
-            all_subject_cols_original=subject_columns, # Pass the original list of all subject columns
-            al_converter_func=al_to_numeric
-        ),
-        axis=1
-    )
-else:
-    st.warning("Cannot calculate 'Weak Subjects': Subject columns not identified.")
-    filtered_df['Weak Subjects'] = np.nan # Assign NaN or handle appropriately if no subject columns
-
-# Dynamically create display columns
-display_cols = ['Name', 'Class', 'Total Marks', 'Aggregate AL', 'Weak Subjects']
-# Add AL columns for subjects that are actually present in the data and subject_columns list
-# Ensure subject_columns is not empty before iterating
-if 'subject_columns' in locals() and subject_columns:
-    for s in subject_columns:
-        al_col_name = f"{s}_AL"
-        if al_col_name in filtered_df.columns:
-            display_cols.append(al_col_name)
-
-# Ensure all display_cols actually exist in filtered_df
-display_cols_present = [col for col in display_cols if col in filtered_df.columns]
-
-# Filter options for sorting, ensuring only valid columns are selectable
-sort_options_for_display = [col for col in ['Name', 'Total Marks', 'Aggregate AL', 'Weak Subjects'] if col in display_cols_present]
-
-if not sort_options_for_display:
-    st.info("No numerical columns available for sorting individual student data.")
-    # Display table without sorting if no sortable columns
-    st.dataframe(filtered_df[display_cols_present], use_container_width=True)
-else:
-    sort_option = st.selectbox(
-        "Sort students by:",
-        options=sort_options_for_display,
-        index=0 if 'Name' in sort_options_for_display else (
-            (sort_options_for_display.index('Total Marks') if 'Total Marks' in sort_options_for_display else 0)
-        )
-    )
-    ascending = st.checkbox("Sort ascending?", value=False) # Default descending for marks/AL (lower AL sum is better)
-
-    # Apply sorting
-    sorted_df_display = filtered_df[display_cols_present].sort_values(by=sort_option, ascending=ascending)
-
-    st.dataframe(
-        sorted_df_display.style.apply(
-            calculate_weak_subjects, # Use the modified function directly
-            axis=1,
-            # Pass the original list of all subject columns for average AL calculation
-            all_subject_cols_original=subject_columns,
-            al_converter_func=al_to_numeric
-        ),
-        use_container_width=True
-    )
-
-st.sidebar.markdown("---")
-st.sidebar.info("Dashboard developed using Streamlit, Pandas, Altair, and Plotly.")
+                if sub in row.index: # Ensure subject column exists in the row
+                    al_val = map_to_al_
